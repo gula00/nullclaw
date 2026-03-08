@@ -35,6 +35,8 @@ pub const Skill = struct {
     missing_deps: []const u8 = "",
     /// Path to the skill directory on disk (for read_file references).
     path: []const u8 = "",
+    /// Filename of the manifest that defined this skill (e.g. "SKILL.toml", "skill.json", "SKILL.md").
+    manifest_file: []const u8 = "",
 };
 
 pub const SkillManifest = struct {
@@ -289,6 +291,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
             .requires_bins = &.{},
             .requires_env = &.{},
             .path = path,
+            .manifest_file = "SKILL.toml",
         };
     }
 
@@ -328,6 +331,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
             .requires_bins = manifest.requires_bins,
             .requires_env = manifest.requires_env,
             .path = path,
+            .manifest_file = "skill.json",
         };
     }
 
@@ -360,6 +364,7 @@ pub fn loadSkill(allocator: std.mem.Allocator, skill_dir_path: []const u8) !Skil
         .requires_bins = &.{},
         .requires_env = &.{},
         .path = path,
+        .manifest_file = "SKILL.md",
     };
 }
 
