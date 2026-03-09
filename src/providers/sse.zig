@@ -1,7 +1,19 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const root = @import("root.zig");
 const http_util = @import("../http_util.zig");
 const log = std.log.scoped(.provider_sse);
+
+// Test-only override so SSE curl invocation can be exercised deterministically
+// without relying on a real curl binary or network access.
+var test_curl_executable_override: ?[]const u8 = null;
+
+fn curl_executable() []const u8 {
+    if (builtin.is_test) {
+        if (test_curl_executable_override) |path| return path;
+    }
+    return "curl";
+}
 
 fn finalizeStreamResult(
     allocator: std.mem.Allocator,
@@ -101,7 +113,7 @@ pub fn curlStream(
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
 
-    argv_buf[argc] = "curl";
+    argv_buf[argc] = curl_executable();
     argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
@@ -401,7 +413,7 @@ pub fn curlStreamAnthropic(
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
 
-    argv_buf[argc] = "curl";
+    argv_buf[argc] = curl_executable();
     argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
@@ -561,6 +573,62 @@ pub fn curlStreamAnthropic(
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
+const TestStreamCollector = struct {
+    allocator: std.mem.Allocator,
+    text: std.ArrayListUnmanaged(u8) = .empty,
+    saw_final: bool = false,
+
+    fn deinit(self: *TestStreamCollector) void {
+        self.text.deinit(self.allocator);
+    }
+
+    fn on_chunk(ctx: *anyopaque, chunk: root.StreamChunk) void {
+        const self: *TestStreamCollector = @ptrCast(@alignCast(ctx));
+        if (chunk.is_final) {
+            self.saw_final = true;
+            return;
+        }
+        self.text.appendSlice(self.allocator, chunk.delta) catch @panic("OOM");
+    }
+};
+
+fn write_fake_curl_script(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    name: []const u8,
+    expected_body: []const u8,
+    stdout_payload: []const u8,
+) ![]u8 {
+    const script = try std.fmt.allocPrint(
+        allocator,
+        \\#!/bin/sh
+        \\set -eu
+        \\expected='{s}'
+        \\for arg in "$@"; do
+        \\  if [ "$arg" = "$expected" ]; then
+        \\    exit 91
+        \\  fi
+        \\done
+        \\stdin_data=$(cat)
+        \\if [ "$stdin_data" != "$expected" ]; then
+        \\  exit 92
+        \\fi
+        \\cat <<'__NULLCLAW_EOF__'
+        \\{s}
+        \\__NULLCLAW_EOF__
+        \\
+    ,
+        .{ expected_body, stdout_payload },
+    );
+    defer allocator.free(script);
+
+    const file = try dir.createFile(name, .{});
+    defer file.close();
+    try file.writeAll(script);
+    try file.chmod(0o755);
+    return try dir.realpathAlloc(allocator, name);
+}
+
 test "parseSseLine valid delta" {
     const allocator = std.testing.allocator;
     const result = try parseSseLine(allocator, "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}");
@@ -704,4 +772,84 @@ test "extractAnthropicUsage correct JSON returns token count" {
     const json = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}";
     const result = (try extractAnthropicUsage(json)).?;
     try std.testing.expect(result == 57);
+}
+
+test "curlStream uses stdin payload transport" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const body = "request-body-sentinel";
+    const stdout_payload =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n" ++
+        "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n" ++
+        "data: [DONE]\n";
+    const curl_path = try write_fake_curl_script(allocator, tmp_dir.dir, "fake-curl-sse.sh", body, stdout_payload);
+    defer allocator.free(curl_path);
+
+    test_curl_executable_override = curl_path;
+    defer test_curl_executable_override = null;
+
+    var collector = TestStreamCollector{ .allocator = allocator };
+    defer collector.deinit();
+
+    const result = try curlStream(
+        allocator,
+        "https://example.com/v1/chat/completions",
+        body,
+        null,
+        &.{},
+        0,
+        TestStreamCollector.on_chunk,
+        @ptrCast(&collector),
+    );
+    defer if (result.content) |content| allocator.free(content);
+
+    try std.testing.expectEqualStrings("Hello world", result.content.?);
+    try std.testing.expectEqualStrings("Hello world", collector.text.items);
+    try std.testing.expect(collector.saw_final);
+}
+
+test "curlStreamAnthropic uses stdin payload transport" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const body = "anthropic-request-body";
+    const stdout_payload =
+        "event: content_block_delta\n" ++
+        "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n" ++
+        "event: content_block_delta\n" ++
+        "data: {\"delta\":{\"type\":\"text_delta\",\"text\":\" from Anthropic\"}}\n" ++
+        "event: message_delta\n" ++
+        "data: {\"usage\":{\"output_tokens\":7}}\n" ++
+        "event: message_stop\n" ++
+        "data: {\"type\":\"message_stop\"}\n";
+    const curl_path = try write_fake_curl_script(allocator, tmp_dir.dir, "fake-curl-anthropic.sh", body, stdout_payload);
+    defer allocator.free(curl_path);
+
+    test_curl_executable_override = curl_path;
+    defer test_curl_executable_override = null;
+
+    var collector = TestStreamCollector{ .allocator = allocator };
+    defer collector.deinit();
+
+    const result = try curlStreamAnthropic(
+        allocator,
+        "https://example.com/v1/messages",
+        body,
+        &.{},
+        TestStreamCollector.on_chunk,
+        @ptrCast(&collector),
+    );
+    defer if (result.content) |content| allocator.free(content);
+
+    try std.testing.expectEqualStrings("Hello from Anthropic", result.content.?);
+    try std.testing.expectEqualStrings("Hello from Anthropic", collector.text.items);
+    try std.testing.expectEqual(@as(u32, 7), result.usage.completion_tokens);
+    try std.testing.expect(collector.saw_final);
 }
