@@ -62,8 +62,8 @@ fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
     return null;
 }
 
-fn shouldFallbackToResponses(body: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return false;
+fn shouldFallbackToResponses(allocator: std.mem.Allocator, body: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;
 
@@ -854,7 +854,7 @@ pub const OpenAiCompatibleProvider = struct {
 
         return parseTextResponse(allocator, resp_body) catch |err| {
             // Only switch protocols when chat-completions explicitly reports endpoint absence.
-            if (self.supports_responses_fallback and shouldFallbackToResponses(resp_body)) {
+            if (self.supports_responses_fallback and shouldFallbackToResponses(allocator, resp_body)) {
                 return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model, 0) catch {
                     logCompatibleApiError(allocator, self.name, err, url, resp_body);
                     return err;
@@ -1597,11 +1597,11 @@ test "responsesUrl non-v1 api path uses raw suffix" {
 }
 
 test "shouldFallbackToResponses only for explicit 404 payloads" {
-    try std.testing.expect(shouldFallbackToResponses("{\"error\":{\"message\":\"Not found\",\"code\":404}}"));
-    try std.testing.expect(shouldFallbackToResponses("{\"status\":404,\"message\":\"unknown endpoint\"}"));
-    try std.testing.expect(!shouldFallbackToResponses("{\"error\":{\"message\":\"temporary overload\",\"code\":503}}"));
-    try std.testing.expect(!shouldFallbackToResponses("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
-    try std.testing.expect(!shouldFallbackToResponses("not json at all"));
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"Not found\",\"code\":404}}"));
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"status\":404,\"message\":\"unknown endpoint\"}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "not json at all"));
 }
 
 test "responsesUrl requires exact suffix match" {
